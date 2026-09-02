@@ -1456,6 +1456,7 @@
 #define REG_NVME_INIT_CTRL2_2   XDATA_REG8(0xC44A)  // NVMe init ctrl2 byte 2 (0xFF)
 #define REG_NVME_INIT_CTRL2_3   XDATA_REG8(0xC44B)  // NVMe init ctrl2 byte 3 (0xFF)
 #define REG_NVME_CMD_STATUS_50  XDATA_REG8(0xC450)  // 0=idle, 2=bulk DMA active
+#define   NVME_CMD_STATUS_DMA_ACTIVE 0x02  // Bit 1: set from SRAM DMA arm through transfer completion
 #define REG_NVME_QUEUE_STATUS_51 XDATA_REG8(0xC451) // NVMe queue status
 #define   NVME_QUEUE_STATUS_51_MASK 0x1F  // Bits 0-4: Queue status index
 #define REG_DMA_ENTRY           XDATA_REG16(0xC462)

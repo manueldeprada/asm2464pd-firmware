@@ -43,6 +43,59 @@ static uint8_t is_usb2;
 /* Streaming PCIe state — configured via 0xF0 control message */
 static uint32_t dma_dwords;    /* total dwords remaining for streaming transfer */
 
+/* Chained SRAM OUT state — configured via 0xF5 and advanced from the main loop once the
+ * C4xx DMA engine reports idle.  Ported from russedavid/asm2464pd-firmware bounty/nv-usb3-wip
+ * (4e856ec).  Each transfer is `sram_stream_slots` whole 16 KiB slots; the destination slot
+ * advances by that count after every completed bulk transfer and wraps to the first slot when
+ * the next transfer would exceed slot 31.  The host therefore issues one control request for a
+ * whole GSP image stream instead of one per 112 KiB batch. */
+static volatile uint16_t __xdata sram_stream_remaining;
+static volatile uint8_t __xdata sram_stream_first_slot;
+static volatile uint8_t __xdata sram_stream_slot;
+static volatile uint8_t __xdata sram_stream_slots;
+static volatile uint8_t __xdata sram_stream_dma_active;
+
+#define CRITICAL_ENTER()  (IE &= (uint8_t)~IE_EA)
+#define CRITICAL_EXIT()   (IE |= IE_EA)
+
+static void sram_stream_cancel(void) {
+  sram_stream_remaining = 0;
+  sram_stream_dma_active = 0;
+}
+
+static void sram_stream_arm(void) {
+  sram_stream_dma_active = 0;
+  REG_NVME_DOORBELL       = 0x0;
+  REG_NVME_SECTOR_SIZE_HI = 0x02;
+  REG_NVME_SECTOR_SIZE_LO = 0x00;
+  REG_NVME_SLOT_START = NVME_SLOT_ENABLE | sram_stream_slot;
+  REG_NVME_SLOT_END   = sram_stream_slots + sram_stream_slot;
+  REG_NVME_SECTOR_COUNT_HI = (uint8_t)(((uint16_t)sram_stream_slots * 32U) >> 8);
+  REG_NVME_SECTOR_COUNT_LO = (uint8_t)((uint16_t)sram_stream_slots * 32U);
+  REG_NVME_CTRL_STATUS = NVME_CTRL_DMA_START | NVME_CTRL_WRITE_DIR;
+  REG_NVME_CMD_PARAM   = sram_stream_slot;
+  sram_stream_dma_active = 1;
+}
+
+/* Called from the main loop.  Re-arms the next slot group as soon as the engine goes idle,
+ * so the only gap between consecutive bulk transfers is this loop's latency. */
+static void sram_stream_poll(void) {
+  if (!sram_stream_remaining || !sram_stream_dma_active ||
+      (REG_NVME_CMD_STATUS_50 & NVME_CMD_STATUS_DMA_ACTIVE)) return;
+
+  CRITICAL_ENTER();
+  if (sram_stream_remaining && sram_stream_dma_active && !(REG_NVME_CMD_STATUS_50 & NVME_CMD_STATUS_DMA_ACTIVE)) {
+    sram_stream_dma_active = 0;
+    sram_stream_remaining--;
+    if (sram_stream_remaining) {
+      sram_stream_slot += sram_stream_slots;
+      if (sram_stream_slot + sram_stream_slots > 32) sram_stream_slot = sram_stream_first_slot;
+      sram_stream_arm();
+    }
+  }
+  CRITICAL_EXIT();
+}
+
 #include "pcie_pio.h"
 #include "pcie_tuning.h"
 #include "i2c.h"
@@ -258,6 +311,7 @@ static void handle_usb_control(void) {
       uint8_t slot_sel = REG_USB_SETUP_WIDX_L;
       uint8_t num_slots = REG_USB_SETUP_WIDX_H;
       if (num_slots == 0) num_slots = 1;
+      sram_stream_cancel();
       /* DMA_INIT sequence for SRAM DMA */
       REG_NVME_DOORBELL       = 0x0;
       REG_NVME_SECTOR_SIZE_HI = 0x02;
@@ -268,6 +322,21 @@ static void handle_usb_control(void) {
       REG_NVME_SECTOR_COUNT_LO = (uint8_t)(sectors & 0xFF);
       REG_NVME_CTRL_STATUS = NVME_CTRL_DMA_START | (bulk_in ? 0 : NVME_CTRL_WRITE_DIR);
       REG_NVME_CMD_PARAM   = slot_sel;
+      usb_send_zlp();
+    } else if (bmReq == (USB_SETUP_DIR_HOST_TO_DEV | USB_SETUP_TYPE_VENDOR) && bReq == 0xF5) {
+      /* 0xF5: arm a sequence of equal, whole-slot SRAM OUT transfers.
+       * wValue = transfer count, wIndex low = first slot, wIndex high = slots/transfer.
+       * A count of 0 or an out-of-range slot window only cancels any stream in progress. */
+      sram_stream_cancel();
+      if ((wValL || wValH) && REG_USB_SETUP_WIDX_H && REG_USB_SETUP_WIDX_L < 32 &&
+          REG_USB_SETUP_WIDX_L + REG_USB_SETUP_WIDX_H <= 32) {
+        dma_dwords = 0;
+        sram_stream_remaining = ((uint16_t)wValH << 8) | wValL;
+        sram_stream_first_slot = REG_USB_SETUP_WIDX_L;
+        sram_stream_slot = REG_USB_SETUP_WIDX_L;
+        sram_stream_slots = REG_USB_SETUP_WIDX_H;
+        sram_stream_arm();
+      }
       usb_send_zlp();
     } else if (bmReq == (USB_SETUP_DIR_HOST_TO_DEV | USB_SETUP_TYPE_VENDOR) && bReq == 0xF3) {
       /* 0xF3: PCIe power control.
@@ -402,7 +471,7 @@ void handle_usb_bulk_data(void) {
   if (bulk_cfg1 & USB_EP_CFG1_BULK_OUT_COMPLETE) {
     REG_USB_EP_CFG1 = USB_EP_CFG1_BULK_OUT_COMPLETE;
     uint16_t dword_count = (((uint16_t)REG_USB_BULK_OUT_BC_H << 8) | REG_USB_BULK_OUT_BC_L) >> 2;
-    if (dma_dwords >= dword_count) {
+    if (!sram_stream_remaining && dma_dwords >= dword_count) {
       pcie_write_chunk((__xdata uint8_t *)0x7000, dword_count);
       dma_dwords -= dword_count;
       if (dma_dwords > 0) REG_USB_EP_CFG2 = USB_EP_CFG2_ARM_OUT; // re-arm OUT
@@ -520,7 +589,10 @@ void main(void) {
   ina231_init();
 
   while (1) {
-    // DO NOT PUT ANYTHING HERE, EVERYTHING SHOULD BE HANDLED IN INTERRUPTS
+    // Everything else is handled in interrupts.  This poll only reads the C4xx DMA status
+    // register and re-arms the next chained SRAM OUT slot group under a critical section;
+    // it never touches DPX or the USB endpoint state.
+    sram_stream_poll();
   }
 }
 
